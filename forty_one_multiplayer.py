@@ -38,8 +38,6 @@ def connect():
         to=str(room_id)
     )
 
-    print(rooms)
-
     if len(room["players"]) == room_size and room["state"] == "matchmaking":
         print(f"Room {room_id} is full. Starting game!")
 
@@ -75,11 +73,13 @@ def connect():
         room["discarded"] = []
         room["turn_type"] = turn_type
         room["state"] = "playing"
+        room["drawn_discarded_card"] = ""
+        room["last_pick_chance"] = True
 
         players = [{"id": p["id"], "name": p["name"], "cards": p["cards"]} for p in room["players"]]
         emit(
             'start_game',
-            {"players": players, "cards": cards, "player_turn": player_turn, "turn_type": turn_type},
+            {"players": players, "cards": cards, "player_turn": player_turn, "turn_type": turn_type, "drawn_discarded_card": room["drawn_discarded_card"]},
             to=str(room_id))
 
 @socketio.on('disconnect')
@@ -97,6 +97,7 @@ def disconnect():
 
                     if player["id"] == room["player_turn"]:
                         room["turn_type"] = "draw"
+                        room["drawn_discarded_card"] = ""
 
                         players_turn_that_disconnected = True
 
@@ -107,29 +108,65 @@ def disconnect():
                             if room["player_turn"] in [p["id"] for p in room["players"]]:
                                 break
 
-                    emit(
-                        'disconnect_on_game',
-                        {"room_id": room["id"], "player_id": player["id"],
-                         "player_turn": room["player_turn"], "turn_type": room["turn_type"],
-                         "players_turn_that_disconnected": players_turn_that_disconnected},
-                        to=str(room["id"])
-                    )
-
-                    if len(room["players"]) == 1:
-                        room["state"] = "finished"
-
-                        result = {
-                            "id": room["players"][0]["id"],
-                            "name": room["players"][0]["name"],
-                            "score": get_best_suit_score(convert_to_dict(room["players"][0]["cards"]))
-                        }
-
+                    if room["last_pick_chance"]:
                         emit(
-                            'one_player_win',
-                            {"winner": room["players"][0]["id"],
-                             "result": [result]},
+                            'disconnect_on_game',
+                            {"room_id": room["id"], "player_id": player["id"],
+                             "player_turn": room["player_turn"], "turn_type": room["turn_type"],
+                             "players_turn_that_disconnected": players_turn_that_disconnected,
+                             "drawn_discarded_card": room["drawn_discarded_card"]},
                             to=str(room["id"])
                         )
+
+                        if len(room["players"]) == 1:
+                            room["state"] = "finished"
+
+                            result = {
+                                "id": room["players"][0]["id"],
+                                "name": room["players"][0]["name"],
+                                "score": get_best_suit_score(convert_to_dict(room["players"][0]["cards"]))
+                            }
+
+                            emit(
+                                'win',
+                                {"winner": room["players"][0]["id"],
+                                 "result": [result]},
+                                to=str(room["id"])
+                            )
+                    else:
+                        if players_turn_that_disconnected:
+                            winner, scores = check_highest_score_and_win(room)
+
+                            emit(
+                                'win',
+                                {"winner": winner, "result": scores},
+                                to=str(room["id"])
+                            )
+                        else:
+                            emit(
+                                'disconnect_on_game',
+                                {"room_id": room["id"], "player_id": player["id"],
+                                 "player_turn": room["player_turn"], "turn_type": room["turn_type"],
+                                 "players_turn_that_disconnected": players_turn_that_disconnected,
+                                 "drawn_discarded_card": room["drawn_discarded_card"]},
+                                to=str(room["id"])
+                            )
+
+                            if len(room["players"]) == 1:
+                                room["state"] = "finished"
+
+                                result = {
+                                    "id": room["players"][0]["id"],
+                                    "name": room["players"][0]["name"],
+                                    "score": get_best_suit_score(convert_to_dict(room["players"][0]["cards"]))
+                                }
+
+                                emit(
+                                    'win',
+                                    {"winner": room["players"][0]["id"],
+                                     "result": [result]},
+                                    to=str(room["id"])
+                                )
 
                 if room["state"] == "matchmaking":
                     emit(
@@ -156,9 +193,13 @@ def draw_card(data):
                 if not room["discarded"]:
                     action = "draw_from_deck"
 
+                if not room["cards"]:
+                    action = "draw_discarded"
+
                 if action == "draw_discarded":
                     discarded = room["discarded"].pop()
                     player["cards"].append(discarded)
+                    room["drawn_discarded_card"] = discarded
 
                 if action == "draw_from_deck":
                     card = room["cards"].pop()
@@ -168,7 +209,9 @@ def draw_card(data):
 
                 emit(
                     'after_draw_card',
-                    {"turn_type": room["turn_type"], "action": action, "player_turn": room["player_turn"], "player_id": player_id},
+                    {"turn_type": room["turn_type"], "action": action,
+                     "player_turn": room["player_turn"], "player_id": player_id,
+                     "drawn_discarded_card": room["drawn_discarded_card"]},
                     to=str(room["id"])
                 )
 
@@ -190,6 +233,7 @@ def discard_card(data):
                     room["discarded"].clear()
 
                 room["discarded"].append(card_to_discard)
+                room["drawn_discarded_card"] = ""
 
                 best_score = get_best_suit_score(convert_to_dict(player["cards"]))
 
@@ -204,37 +248,23 @@ def discard_card(data):
                         scores.append({"score": score, "id": p["id"], "name": p["name"]})
 
                     emit(
-                        'win',
+                        'win_after_discard',
                         {"card": card_to_discard, "player_id": player_id, "winner": player_id, "result": scores},
                         to=str(room["id"])
                     )
                 else:
-                    if not room["cards"]:
-                        highest_score = 0
-                        scores = []
-
-                        room["state"] = "finished"
-
-                        for p in room["players"]:
-                            score = get_best_suit_score(convert_to_dict(p["cards"]))
-
-                            scores.append({"score": score, "id": p["id"], "name": p["name"]})
-                            highest_score = max(score, highest_score)
-
-                        winners = [s["id"] for s in scores if s["score"] == highest_score]
-                        winner = winners[-1]
-
-                        for i in range(room["player_first_turn"], room["player_first_turn"] + 4):
-                            if (i % 4) in winners:
-                                winner = i % 4
-                                break
+                    if not room["cards"] and not room["last_pick_chance"]:
+                        winner, scores = check_highest_score_and_win(room)
 
                         emit(
-                            'win',
+                            'win_after_discard',
                             {"card": card_to_discard, "player_id": player_id, "winner": winner, "result": scores},
                             to=str(room["id"])
                         )
                     else:
+                        if not room["cards"] and room["last_pick_chance"]:
+                            room["last_pick_chance"] = False
+
                         room["turn_type"] = "draw"
 
                         while True:
@@ -247,11 +277,51 @@ def discard_card(data):
                         emit(
                             'after_discard_card',
                             {"turn_type": room["turn_type"], "card": card_to_discard,
-                             "player_turn": room["player_turn"], "player_id": player_id},
+                             "player_turn": room["player_turn"], "player_id": player_id,
+                             "drawn_discarded_card": room["drawn_discarded_card"],
+                             "last_pick_chance": room["last_pick_chance"]},
                             to=str(room["id"])
                         )
 
                 return
+
+@socketio.on('win')
+def win(data):
+    sid = request.sid
+    player_id = data["player_id"]
+
+    for room in rooms:
+        for player in room["players"]:
+            if player["sid"] == sid and room["player_turn"] == player["id"] and player["id"] == player_id:
+                winner, scores = check_highest_score_and_win(room)
+
+                emit(
+                    'win',
+                    {"winner": winner, "result": scores},
+                    to=str(room["id"])
+                )
+
+def check_highest_score_and_win(room):
+    highest_score = 0
+    scores = []
+
+    room["state"] = "finished"
+
+    for p in room["players"]:
+        score = get_best_suit_score(convert_to_dict(p["cards"]))
+
+        scores.append({"score": score, "id": p["id"], "name": p["name"]})
+        highest_score = max(score, highest_score)
+
+    winners = [s["id"] for s in scores if s["score"] == highest_score]
+    winner = winners[-1]
+
+    for i in range(room["player_first_turn"], room["player_first_turn"] + 4):
+        if (i % 4) in winners:
+            winner = i % 4
+            break
+
+    return winner, scores
 
 def get_best_suit_score(hand):
     from itertools import groupby
